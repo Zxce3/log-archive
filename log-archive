@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+
+# log-archive - Advanced Log Archival Tool
+# Author: Zxce3
+# Created: 2025-02-23
+# Version: 1.0.0
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# Default Configuration
+declare -A CONFIG=(
+    [ARCHIVE_DIR]="${HOME}/.local/share/log-archive/archives"
+    [CONFIG_DIR]="${HOME}/.config/log-archive"
+    [LOG_DIR]="${HOME}/.local/share/log-archive/logs"
+    [COMPRESSION]="zstd"  # Options: gzip, bzip2, xz, zstd
+    [RETENTION_DAYS]=30
+    [MIN_DISK_SPACE]=500  # MB
+    [VERIFY_CHECKSUM]=true
+    [LOG_LEVEL]="INFO"    # DEBUG, INFO, WARN, ERROR
+    [USE_PROGRESS_BAR]=true
+)
+
+# ANSI Color Codes
+declare -A COLORS=(
+    [RED]='\033[0;31m'
+    [GREEN]='\033[0;32m'
+    [YELLOW]='\033[1;33m'
+    [BLUE]='\033[0;34m'
+    [PURPLE]='\033[0;35m'
+    [CYAN]='\033[0;36m'
+    [GRAY]='\033[0;37m'
+    [BOLD]='\033[1m'
+    [RESET]='\033[0m'
+)
+
+# Logging Levels
+declare -A LOG_LEVELS=(
+    [DEBUG]=0
+    [INFO]=1
+    [WARN]=2
+    [ERROR]=3
+)
+
+# Initialize variables
+SCRIPT_NAME=$(basename "$0")
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+LOG_FILE=""
+CONFIG_FILE=""
+SOURCE_DIR=""
+
+# Function to print usage
+usage() {
+    printf "${COLORS[BOLD]}Usage:${COLORS[RESET]} %s [OPTIONS] <source-directory>\n\n" "$SCRIPT_NAME"
+    
+    printf "${COLORS[BOLD]}Options:${COLORS[RESET]}\n"
+    printf "    -c, --config <file>     Use custom config file\n"
+    printf "    -m, --compression       Compression method (gzip|bzip2|xz|zstd)\n"
+    printf "    -r, --retention <days>  Retention period in days\n"
+    printf "    -v, --verbose          Increase verbosity\n"
+    printf "    -q, --quiet            Suppress all output\n"
+    printf "    -h, --help            Show this help message\n\n"
+    
+    printf "${COLORS[BOLD]}Example:${COLORS[RESET]}\n"
+    printf "    %s -c custom.conf -m zstd /var/log\n\n" "$SCRIPT_NAME"
+    
+    printf "${COLORS[BOLD]}Configuration:${COLORS[RESET]}\n"
+    printf "    Default config location: %s/config\n" "${CONFIG[CONFIG_DIR]}"
+    exit 1
+}
+
+# Function to log messages
+log() {
+    local level=$1
+    local message=$2
+    local timestamp
+    timestamp=$(date -u '+%Y-%m-%d %H:%M:%S')
+    
+    # Check if we should log based on LOG_LEVEL
+    if [ "${LOG_LEVELS[$level]}" -ge "${LOG_LEVELS[${CONFIG[LOG_LEVEL]}]}" ]; then
+        local color_code
+        case $level in
+            "DEBUG") color_code=${COLORS[GRAY]} ;;
+            "INFO")  color_code=${COLORS[GREEN]} ;;
+            "WARN")  color_code=${COLORS[YELLOW]} ;;
+            "ERROR") color_code=${COLORS[RED]} ;;
+        esac
+        
+        # Console output (if not quiet)
+        if [[ "${QUIET:-false}" != "true" ]]; then
+            echo -e "${color_code}[$level] ${timestamp} - ${message}${COLORS[RESET]}"
+        fi
+        
+        # File logging
+        echo "[$level] ${timestamp} - ${message}" >> "$LOG_FILE"
+    fi
+}
+
+# Function to check system requirements
+check_system_requirements() {
+    log "INFO" "Checking system requirements..."
+    
+    # Check available disk space
+    local available_space
+    available_space=$(df -m "${CONFIG[ARCHIVE_DIR]}" | awk 'NR==2 {print $4}')
+    if [ "$available_space" -lt "${CONFIG[MIN_DISK_SPACE]}" ]; then
+        log "ERROR" "Insufficient disk space. Required: ${CONFIG[MIN_DISK_SPACE]}MB, Available: ${available_space}MB"
+        exit 1
+    fi
+    
+    # Check required commands
+    local required_commands=(tar awk sed date dirname basename)
+    case ${CONFIG[COMPRESSION]} in
+        gzip)  required_commands+=(gzip) ;;
+        bzip2) required_commands+=(bzip2) ;;
+        xz)    required_commands+=(xz) ;;
+        zstd)  required_commands+=(zstd) ;;
+    esac
+    
+    for cmd in "${required_commands[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            log "ERROR" "Required command not found: $cmd"
+            exit 1
+        fi
+    done
+}
+
+# Function to create directory structure
+create_directories() {
+    local dirs=(
+        "${CONFIG[ARCHIVE_DIR]}"
+        "${CONFIG[CONFIG_DIR]}"
+        "${CONFIG[LOG_DIR]}"
+    )
+    
+    for dir in "${dirs[@]}"; do
+        if [ ! -d "$dir" ]; then
+            mkdir -p "$dir"
+            log "DEBUG" "Created directory: $dir"
+        fi
+    done
+}
+
+# Function to load configuration
+load_config() {
+    local config_file=${1:-"${CONFIG[CONFIG_DIR]}/config"}
+    
+    if [ -f "$config_file" ]; then
+        log "INFO" "Loading configuration from: $config_file"
+        # shellcheck source=/dev/null
+        source "$config_file"
+    else
+        log "WARN" "No configuration file found at: $config_file"
+    fi
+}
+
+# Function to create archive
+create_archive() {
+    local source_dir=$1
+    local archive_name="logs_archive_${TIMESTAMP}"
+    local temp_dir
+    temp_dir=$(mktemp -d)
+    local success=false
+    
+    log "INFO" "Creating archive for: $source_dir"
+    
+    # Prepare archive command based on compression method
+    local compress_cmd
+    local extension
+    case ${CONFIG[COMPRESSION]} in
+        gzip)  compress_cmd="gzip"      ; extension="tar.gz" ;;
+        bzip2) compress_cmd="bzip2"     ; extension="tar.bz2" ;;
+        xz)    compress_cmd="xz"        ; extension="tar.xz" ;;
+        zstd)  compress_cmd="zstd -T0"  ; extension="tar.zst" ;;
+        *)     log "ERROR" "Invalid compression method: ${CONFIG[COMPRESSION]}"
+               exit 1 ;;
+    esac
+    
+    local archive_path="${CONFIG[ARCHIVE_DIR]}/${archive_name}.${extension}"
+    
+    # Create archive with progress indication
+    if [ "${CONFIG[USE_PROGRESS_BAR]}" = "true" ]; then
+        tar -cf - "$source_dir" 2>/dev/null | pv -s "$(du -sb "$source_dir" | awk '{print $1}')" | $compress_cmd > "$archive_path"
+    else
+        tar -cf - "$source_dir" 2>/dev/null | $compress_cmd > "$archive_path"
+    fi
+    
+    # Verify archive
+    if [ "${CONFIG[VERIFY_CHECKSUM]}" = "true" ]; then
+        log "DEBUG" "Verifying archive integrity..."
+        if ! $compress_cmd -t "$archive_path" >/dev/null 2>&1; then
+            log "ERROR" "Archive verification failed: $archive_path"
+            rm -f "$archive_path"
+            exit 1
+        fi
+    fi
+    
+    # Create metadata file
+    cat > "${archive_path}.meta" << EOF
+Created: $(date -u '+%Y-%m-%d %H:%M:%S')
+Source: $source_dir
+Size: $(du -h "$archive_path" | cut -f1)
+Compression: ${CONFIG[COMPRESSION]}
+Checksum: $(sha256sum "$archive_path" | cut -d' ' -f1)
+EOF
+    
+    success=true
+    
+    # Cleanup old archives
+    cleanup_old_archives
+    
+    log "INFO" "Archive created successfully: $archive_path"
+    return 0
+}
+
+# Function to cleanup old archives
+cleanup_old_archives() {
+    log "DEBUG" "Checking for old archives to clean up..."
+    
+    find "${CONFIG[ARCHIVE_DIR]}" -type f -name "logs_archive_*" -mtime +"${CONFIG[RETENTION_DAYS]}" -exec rm -f {} \;
+}
+
+# Function to handle signals
+handle_signal() {
+    log "WARN" "Received signal to terminate"
+    exit 1
+}
+
+# Main function
+main() {
+    local QUIET=false
+    local VERBOSE=false
+    
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -c|--config)
+                CONFIG_FILE="$2"
+                shift 2
+                ;;
+            -m|--compression)
+                CONFIG[COMPRESSION]="$2"
+                shift 2
+                ;;
+            -r|--retention)
+                CONFIG[RETENTION_DAYS]="$2"
+                shift 2
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                CONFIG[LOG_LEVEL]="DEBUG"
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                ;;
+            *)
+                SOURCE_DIR="$1"
+                shift
+                ;;
+        esac
+    done
+    
+    # Validate source directory
+    if [ -z "$SOURCE_DIR" ]; then
+        log "ERROR" "No source directory specified"
+        usage
+    fi
+    
+    if [ ! -d "$SOURCE_DIR" ]; then
+        log "ERROR" "Source directory does not exist: $SOURCE_DIR"
+        exit 1
+    fi
+    
+    # Initialize logging
+    LOG_FILE="${CONFIG[LOG_DIR]}/log-archive_${TIMESTAMP}.log"
+    create_directories
+    
+    # Load configuration
+    if [ -n "$CONFIG_FILE" ]; then
+        load_config "$CONFIG_FILE"
+    else
+        load_config
+    fi
+    
+    # Set up signal handlers
+    trap handle_signal SIGINT SIGTERM
+    
+    # Start archival process
+    log "INFO" "Starting log archival process..."
+    check_system_requirements
+    create_archive "$SOURCE_DIR"
+}
+
+# Execute main function
+main "$@"
